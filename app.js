@@ -1,4 +1,4 @@
-/* DuckGoDo phone (Build 26). One file, no libraries, nothing but this page's own storage.
+/* DuckGoDo phone (Build 27). One file, no libraries, nothing but this page's own storage.
  *
  * WHAT THIS PAGE HOLDS: only a copy of what the laptop last uploaded (snapshot.json) plus your own changes that have not been merged yet,
  * both in this browser's localStorage. No keys, no secrets live in the page: the Google Client ID in config.js is a public name, and
@@ -15,12 +15,19 @@
  *   schedItems       = scItemsOn (script.js)                                      which schedule items fall on a date
  *   formatDuration   = formatDuration (script.js) = the `duration` filter (app.py)
  *   t12              = the 12-hour times of the Schedule page
+ *   openNote wording = openNoteModal (script.js): "Three in a row — what happened?" / "No judgment, just a quick note so future-you has context."
+ *   threeInARow      = check_recent_misses (app.py): the two days before this one are both red / yellow
+ *
+ * BUILD 27 (what changed): one date per page (Quick Log opens on yesterday, Food and Schedule on today); gestures on a Quick Log check
+ * (tap = done / cleared at once, a quick second tap = missed, a long hold = note); the 3-misses-in-a-row prompt; saved-food type-ahead in the
+ * Name field + "Save to my foods" (change type food_lib_add); Inter shipped in fonts/; quieter Google sign-in renewal; the screen is patched
+ * in place (morph) so a tap redraws only what changed.
  */
 (function () {
     "use strict";
 
-    var VERSION = "b26.1";
-    var KEY = "duck.phone.v1", TOK = "duck.phone.tok";
+    var VERSION = "b27.1";
+    var KEY = "duck.phone.v1", SNAPKEY = "duck.phone.snap", TOK = "duck.phone.tok";
     var API = "https://www.googleapis.com/drive/v3", UP = "https://www.googleapis.com/upload/drive/v3";
     var SCOPE = "https://www.googleapis.com/auth/drive.appdata";
     var MEALS = ["breakfast", "lunch", "snack", "dinner"];
@@ -29,6 +36,8 @@
     var WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
     var MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     var LIMITS = { ql: [-14, 0], food: [-14, 0], sc: [-7, 14] };   // how far back / forward each page can go (days)
+    var HOLD_MS = 500, DOUBLE_MS = 300;                            // long hold = note; a second tap within this = missed
+    var RENEW_AHEAD = 5 * 60000, AWAY_MS = 5 * 60000;              // renew the Google token this long before it runs out; away this long = a fresh "open"
 
     // ---------------------------------------------------------------- small helpers
     function $(id) { return document.getElementById(id); }
@@ -90,32 +99,63 @@
         return { v: 1, device: "ph-" + rand(8), snap: null, snapModified: "", queue: [], sent: [], seq: 0, lastSync: 0, lastErr: "",
                  overridden: 0, needLogin: false, consented: false, silentFailedAt: 0 };
     }
+    // Build 27: the snapshot (big) is stored under its own key and rewritten only when it changes; a tap rewrites just the small state.
+    // A Build 26 phone kept it inside KEY: it is read from there once and moved.
+    var snapInline = false, MC = null;
     function load() {
         try {
             var o = JSON.parse(localStorage.getItem(KEY));
-            if (o && o.v === 1 && o.device) return Object.assign(blank(), o);
+            if (o && o.v === 1 && o.device) {
+                var st = Object.assign(blank(), o);
+                var raw = null;
+                try { raw = localStorage.getItem(SNAPKEY); } catch (e) { /* ignore */ }
+                if (raw) { try { st.snap = JSON.parse(raw); } catch (e) { /* damaged: keep the inline copy if there is one */ } }
+                return st;
+            }
         } catch (e) { /* unreadable: start empty */ }
         return blank();
     }
+    function saveSnap() {
+        try { localStorage.setItem(SNAPKEY, JSON.stringify(S.snap)); snapInline = false; } catch (e) { snapInline = true; }
+    }
     function save() {
-        try { localStorage.setItem(KEY, JSON.stringify(S)); MEMORY_ONLY = false; } catch (e) { MEMORY_ONLY = true; }
+        MC = null;   // anything that changes the state also changes the view model
+        try {
+            var copy = snapInline ? S : Object.assign({}, S, { snap: null });
+            localStorage.setItem(KEY, JSON.stringify(copy));
+            MEMORY_ONLY = false;
+        } catch (e) { MEMORY_ONLY = true; }
     }
     var S = load();
-    var U = { tab: "ql", date: today(), dayStamp: today(), sheet: null };   // screen state (not saved)
+    try { if (S.snap && localStorage.getItem(SNAPKEY) == null) { saveSnap(); save(); } } catch (e) { /* ignore */ }   // moves a Build 26 inline snapshot to its own key
+    // One date PER PAGE (Build 27): Quick Log = yesterday, Food and Schedule = today, at every open and at day rollover.
+    var U = { tab: "ql", dates: { ql: addDays(today(), -1), food: today(), sc: today() }, dayStamp: today(), sheet: null, hiddenAt: 0 };   // screen state (not saved)
+    function D() { return U.dates[U.tab]; }
+    function resetDates() { U.dates = { ql: addDays(today(), -1), food: today(), sc: today() }; U.dayStamp = today(); }
     try { var tabSaved = sessionStorage.getItem("duck.tab"); if (tabSaved === "food" || tabSaved === "sc" || tabSaved === "ql") U.tab = tabSaved; } catch (e) { /* ignore */ }
     var syncing = false, syncTimer = 0, ctx = { interactive: false };
 
     // ---------------------------------------------------------------- the view model = snapshot + unmerged changes on top
     function model() {
+        if (MC) return MC;
         var snap = S.snap;
         if (!snap) return null;
         var M = { snap: snap, habits: snap.habits || [], byId: {}, entries: clone(snap.entries || {}), food: clone((snap.food && snap.food.entries) || {}),
-                  log: clone((snap.schedule && snap.schedule.log) || {}), pendFood: {}, pendCell: {}, lockedFood: {} };
+                  log: clone((snap.schedule && snap.schedule.log) || {}), pendFood: {}, pendCell: {}, lockedFood: {},
+                  foods: ((snap.food && snap.food.foods) || []).slice() };   // foods = My foods + the ones saved from this phone that the laptop has not confirmed yet
         M.habits.forEach(function (h) { M.byId[h.id] = h; });
         var all = S.sent.map(function (c) { return { c: c, sent: true }; }).concat(S.queue.map(function (c) { return { c: c, sent: false }; }));
         all.sort(function (a, b) { return a.c.ts - b.c.ts || (a.c.id < b.c.id ? -1 : 1); });
         all.forEach(function (x) { applyChange(M, x.c, x.sent); });
+        M.foods.sort(function (a, b) { return String(a.name).toLowerCase() < String(b.name).toLowerCase() ? -1 : 1; });
+        MC = M;
         return M;
+    }
+    function savedFood(M, name) {   // a saved food with this name (any capitals), or null
+        var n = String(name || "").trim().toLowerCase();
+        if (!n) return null;
+        for (var i = 0; i < M.foods.length; i++) if (String(M.foods[i].name).trim().toLowerCase() === n) return M.foods[i];
+        return null;
     }
     function findFood(M, id) {
         for (var d in M.food) { var a = M.food[d]; for (var i = 0; i < a.length; i++) if (a[i].id === id) return { date: d, list: a, i: i }; }
@@ -139,6 +179,8 @@
         } else if (c.type === "tick") {
             var day = (M.log[c.date] = M.log[c.date] || {});
             if (c.state) day[c.key] = c.state; else delete day[c.key];
+        } else if (c.type === "food_lib_add") {   // shows in the suggestions at once; the laptop skips it as a duplicate if the name is already there
+            if (!savedFood(M, c.name)) M.foods.push({ id: "p:" + c.id, name: c.name, kcal: c.kcal, protein: c.protein, pending: true });
         }
     }
     function foodSum(M, date) {
@@ -164,6 +206,7 @@
         var q = S.queue, entry = ch.entry;
         if (ch.type === "cell") q = q.filter(function (x) { return !(x.type === "cell" && x.habit === ch.habit && x.date === ch.date); });
         if (ch.type === "tick") q = q.filter(function (x) { return !(x.type === "tick" && x.key === ch.key && x.date === ch.date); });
+        if (ch.type === "food_lib_add") q = q.filter(function (x) { return !(x.type === "food_lib_add" && String(x.name).toLowerCase() === String(ch.name).toLowerCase()); });
         if (ch.type === "food_edit" || ch.type === "food_del") {
             if (typeof entry === "string" && entry.indexOf("p:") === 0) {   // a food entry still waiting in the queue: change that record itself
                 var addId = entry.slice(2), add = null;
@@ -185,6 +228,50 @@
 
     // ---------------------------------------------------------------- rendering
     var TITLES = { ql: "Quick log", food: "Food", sc: "Schedule" };
+    // The screen is PATCHED, not rebuilt: the new html is compared with what is on screen and only what differs is touched, so a tap changes
+    // one cell (its colour fades in ~120 ms) instead of redrawing the page. Elements carry data-k so a row is never reused for another habit.
+    function morph(dst, html) {
+        var tmp = document.createElement("div");
+        tmp.innerHTML = html;
+        morphKids(dst, tmp);
+    }
+    function morphKids(a, b) {
+        var ac = a.childNodes, bc = b.childNodes, i;
+        for (i = 0; i < bc.length; i++) {
+            var x = ac[i], y = bc[i];
+            if (!x) { a.appendChild(y.cloneNode(true)); continue; }
+            if (x.nodeType !== y.nodeType || x.nodeName !== y.nodeName || (x.nodeType === 1 && x.getAttribute("data-k") !== y.getAttribute("data-k"))) { a.replaceChild(y.cloneNode(true), x); continue; }
+            if (x.nodeType === 3) { if (x.nodeValue !== y.nodeValue) x.nodeValue = y.nodeValue; continue; }
+            if (x.nodeType !== 1) continue;
+            var j, at;
+            for (j = 0; j < y.attributes.length; j++) { at = y.attributes[j]; if (x.getAttribute(at.name) !== at.value) x.setAttribute(at.name, at.value); }
+            for (j = x.attributes.length - 1; j >= 0; j--) { at = x.attributes[j]; if (!y.hasAttribute(at.name)) x.removeAttribute(at.name); }
+            morphKids(x, y);
+        }
+        while (a.childNodes.length > bc.length) a.removeChild(a.lastChild);
+    }
+    var fadeT = 0;
+    function fadeIn() {   // the page / day fade (~300 ms): only when the page or the day changed, never for a tap
+        var v = $("view");
+        clearTimeout(fadeT);
+        v.classList.remove("enter");
+        void v.offsetWidth;
+        v.classList.add("enter");
+        fadeT = setTimeout(function () { v.classList.remove("enter"); }, 340);
+    }
+    function daybarHtml() {
+        var date = D(), lim = LIMITS[U.tab], n = diffDays(date, today());
+        var d = new Date(date + "T12:00:00");
+        var prev = '<button type="button" class="d-btn" data-act="day" data-n="-1"' + (n <= lim[0] ? " disabled" : "") + ' aria-label="Previous day">‹</button>';
+        var next = '<button type="button" class="d-btn" data-act="day" data-n="1"' + (n >= lim[1] ? " disabled" : "") + ' aria-label="Next day">›</button>';
+        if (U.tab === "ql") {   // Yesterday | Today toggle + arrows (back 14 days, never forward past today)
+            return prev + '<div class="d-label"><b>' + esc(WEEKDAYS[dow(date)] + " " + d.getDate() + " " + MONTHS[d.getMonth()]) + "</b></div>" +
+                '<div class="seg" role="group" aria-label="Day"><button type="button" data-act="ql-set" data-d="-1" class="' + (n === -1 ? "on" : "") + '">Yesterday</button>' +
+                '<button type="button" data-act="ql-set" data-d="0" class="' + (n === 0 ? "on" : "") + '">Today</button></div>' + next;
+        }
+        return prev + '<div class="d-label"><b>' + esc(dayLabel(date)) + "</b>" + (n === 0 ? " · " + esc(dayFull(date)) : "") + "</div>" +
+            (n !== 0 ? '<button type="button" class="d-today" data-act="day-today">Today</button>' : "") + next;
+    }
     function render() {
         var y = window.scrollY, M = model();
         if (M && !U.hadModel) { U.hadModel = true; U.enter = true; }
@@ -192,19 +279,14 @@
         $("title").textContent = TITLES[U.tab];
         $("eyebrow").textContent = M && M.snap.username ? "Hi, " + M.snap.username : "DuckGoDo";
         $("fab").hidden = !(U.tab === "food" && M);
-        var lim = LIMITS[U.tab], n = diffDays(U.date, today());
-        $("daybar").innerHTML = '<button type="button" class="d-btn" data-act="day" data-n="-1"' + (n <= lim[0] ? " disabled" : "") + ' aria-label="Previous day">‹</button>' +
-            '<div class="d-label"><b>' + esc(dayLabel(U.date)) + "</b>" + (n === 0 ? " · " + esc(dayFull(U.date)) : "") + "</div>" +
-            (n !== 0 ? '<button type="button" class="d-today" data-act="day-today">Today</button>' : "") +
-            '<button type="button" class="d-btn" data-act="day" data-n="1"' + (n >= lim[1] ? " disabled" : "") + ' aria-label="Next day">›</button>';
+        morph($("daybar"), daybarHtml());
         var html;
         if (!M) html = emptyHtml();
         else if (U.tab === "ql") html = renderQL(M);
         else if (U.tab === "food") html = renderFood(M);
         else html = renderSched(M);
-        $("view").classList.toggle("enter", !!U.enter);
+        if (U.enter) { $("view").innerHTML = html; fadeIn(); } else morph($("view"), html);
         U.enter = false;
-        $("view").innerHTML = html;
         paintChip();
         window.scrollTo(0, y);
     }
@@ -229,17 +311,17 @@
         var pend = M.pendCell[h.id + ":" + date];
         var color = h.color ? ' style="--done:' + esc(h.color) + '"' : "";
         var note = h.routine ? '<span class="note">routine</span>' : h.food_metric ? '<span class="note">food log</span>' : "";
-        return '<div class="row' + (pend ? " pend" : "") + '"' + color + '><button type="button" class="name" data-act="habit" data-h="' + h.id + '">' + esc(h.name) + "</button>" +
+        return '<div class="row' + (pend ? " pend" : "") + '" data-k="h' + h.id + '"' + color + '><button type="button" class="name" data-act="habit" data-h="' + h.id + '">' + esc(h.name) + "</button>" +
             note + '<span class="val">' + valText(h, c[1], st) + "</span>" +
             '<button type="button" class="cell ' + (st === "grey" ? "" : st) + (h.derived ? " locked" : "") + '" data-act="cell" data-h="' + h.id + '" aria-label="' + esc(h.name) + (isCheck ? "" : " value") + '"></button></div>';
     }
     function renderQL(M) {
-        var date = U.date, hs = M.habits.filter(function (h) { return !h.ql_hidden; });
+        var date = D(), hs = M.habits.filter(function (h) { return !h.ql_hidden; });
         var nn = hs.filter(function (h) { return h.list_type === "nonneg"; }), wip = hs.filter(function (h) { return h.list_type === "wip"; });
         var done = 0;
         nn.forEach(function (h) { if (cellOf(M, h, date)[0] === "green") done++; });
         var pct = nn.length ? Math.round(100 * done / nn.length) : 0;
-        var html = '<div class="progress' + (nn.length && done === nn.length ? " complete" : "") + '" aria-label="Progress"><span style="width:' + pct + '%"></span></div>';
+        var html = '<div class="progress' + (nn.length && done === nn.length ? " complete" : "") + '" aria-label="Progress" data-k="p"><span style="width:' + pct + '%"></span></div>';
         if (!hs.length) return html + '<div class="card"><div class="empty">No habits yet. Add them on the laptop.</div></div>';
         html += '<div class="card">';
         if (nn.length) html += '<div class="section-label">Non-negotiables</div>' + nn.map(function (h) { return rowHtml(M, h, date); }).join("");
@@ -252,7 +334,7 @@
         return statusFor("number", g.target, Math.round(v), g.direction || "min") === "green" ? " ok" : " bad";
     }
     function renderFood(M) {
-        var date = U.date, s = foodSum(M, date), goals = (M.snap.food && M.snap.food.goals) || {};
+        var date = D(), s = foodSum(M, date), goals = (M.snap.food && M.snap.food.goals) || {};
         var gk = goals.kcal, gp = goals.protein;
         function card(name, unit, v, g) {
             var goal = g && g.target ? (g.direction === "max" ? "at most " : "at least ") + num(g.target) : "no goal";
@@ -280,7 +362,7 @@
             html += '<div class="meal-head"><span class="section-label">' + meal + '</span><button type="button" data-act="food-add" data-meal="' + meal + '">+ Add</button></div>';
             html += es.map(function (e) {
                 var locked = M.lockedFood[e.id];
-                return '<button type="button" class="frow' + (e.pending ? " pend" : "") + '" data-act="food-edit" data-id="' + esc(e.id) + '"' + (locked ? ' data-locked="1"' : "") + '><span class="f-name">' + esc(e.name) +
+                return '<button type="button" class="frow' + (e.pending ? " pend" : "") + '" data-k="f' + esc(e.id) + '" data-act="food-edit" data-id="' + esc(e.id) + '"' + (locked ? ' data-locked="1"' : "") + '><span class="f-name">' + esc(e.name) +
                     (e.qty && e.qty !== 1 ? ' <span class="f-sub">× ' + num(e.qty) + "</span>" : "") + '</span><span class="f-nums">' + num(e.kcal) + " kcal<small>" + num(e.protein) + " g protein</small></span></button>";
             }).join("");
         });
@@ -297,11 +379,11 @@
         return out;
     }
     function renderSched(M) {
-        var items = schedItems(M, U.date);
-        if (!items.length) return '<div class="card"><div class="empty">Nothing scheduled for ' + esc(dayLabel(U.date).toLowerCase()) + ".</div></div>";
+        var date = D(), items = schedItems(M, date);
+        if (!items.length) return '<div class="card"><div class="empty">Nothing scheduled for ' + esc(dayLabel(date).toLowerCase()) + ".</div></div>";
         var done = items.filter(function (i) { return i.state === "done"; }).length;
         return '<div class="card"><div class="section-label">' + done + " of " + items.length + " done</div>" + items.map(function (it) {
-            return '<div class="srow ' + (it.state === "done" ? "done" : it.state === "skip" ? "skipped" : "") + '" style="--c:' + esc(it.color || DEFAULT_GREEN) + '">' +
+            return '<div class="srow ' + (it.state === "done" ? "done" : it.state === "skip" ? "skipped" : "") + '" data-k="s' + esc(it.key) + '" style="--c:' + esc(it.color || DEFAULT_GREEN) + '">' +
                 '<span class="bar ' + (it.list_type === "nonneg" ? "" : "wip") + '"></span>' +
                 '<button type="button" class="s-main" data-act="tick" data-key="' + esc(it.key) + '"><div class="s-name">' + esc(it.name) + '</div><div class="s-time">' + t12(it.start) + "–" + t12(it.end) + (it.ev ? " · one day" : "") + (it.state === "skip" ? " · skipped" : "") + "</div></button>" +
                 '<button type="button" class="s-skip" data-act="skip" data-key="' + esc(it.key) + '">' + (it.state === "skip" ? "Unskip" : "Skip") + "</button>" +
@@ -325,6 +407,7 @@
         sh.setAttribute("aria-hidden", "false");
         $("backdrop").classList.add("open");
         U.sheet = true;
+        U.sheetAt = Date.now();
     }
     function closeSheet() {
         $("sheet").classList.remove("open");
@@ -332,16 +415,17 @@
         $("backdrop").classList.remove("open");
         U.sheet = null;
         if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+        checkRollover();   // a day change that happened while the sheet was open
     }
 
     // ---- habit sheet (value, done / missed / clear, note)
     function openHabit(id) {
         var M = model(), h = M && M.byId[id];
         if (!h) return;
-        var date = U.date, c = cellOf(M, h, date);
+        var date = D(), c = cellOf(M, h, date);
         if (h.derived) {
             toast(h.routine ? "This one follows a routine on the laptop." : "This one follows the food log.");
-            if (h.food_metric) { U.tab = "food"; render(); }
+            if (h.food_metric) { U.tab = "food"; U.enter = true; render(); }
             return;
         }
         var body = '<h2>' + esc(h.name) + '</h2><div class="sub">' + esc(dayFull(date)) + (h.target ? " · goal " + (h.direction === "max" ? "at most " : "at least ") + (h.tracking_type === "time" ? formatDuration(h.target) : num(h.target) + (h.unit ? " " + h.unit : "")) : "") + "</div>";
@@ -360,14 +444,28 @@
         }
         body += '<label for="nt">Add a note to this day</label><input id="nt" type="text" placeholder="Title (optional)" maxlength="120" autocomplete="off" style="margin-bottom:8px">' +
             '<textarea id="nc" placeholder="Note" maxlength="2000"></textarea>' +
-            '<div class="btns"><button type="button" class="btn" data-act="save-note" data-h="' + id + '">Add note</button><button type="button" class="btn" data-act="close">Close</button></div>';
+            '<div class="btns"><button type="button" class="btn" data-act="save-note" data-h="' + id + '" data-date="' + date + '">Add note</button><button type="button" class="btn" data-act="close">Close</button></div>';
         openSheet(body);
         var hv = $("hv");
         if (hv) {
             hv.addEventListener("input", function () { previewValue(h); });
             previewValue(h);
-            setTimeout(function () { hv.focus(); hv.select && hv.select(); }, 300);
+            setTimeout(function () { hv.focus(); hv.select && hv.select(); }, 260);
         }
+    }
+    // ---- note sheet: a long hold on a Quick Log cell, and the "Three in a row" prompt (same words as the laptop's openNoteModal)
+    function openNote(h, date, skip) {
+        openSheet('<div class="eyebrow-s">' + esc(h.name) + " · " + esc(dayLabel(date)) + "</div>" +
+            "<h2>" + (skip ? "Three in a row — what happened?" : "Add a note") + "</h2>" +
+            '<div class="sub">' + (skip ? "No judgment, just a quick note so future-you has context." : "A few words for your future self is enough.") + "</div>" +
+            '<input id="nt" type="text" placeholder="Title (optional)" maxlength="120" autocomplete="off" aria-label="Note title" style="margin-bottom:8px">' +
+            '<textarea id="nc" placeholder="Note" maxlength="2000" aria-label="Note"></textarea>' +
+            '<div class="btns"><button type="button" class="btn primary" data-act="save-note" data-h="' + h.id + '" data-date="' + date + '"' + (skip ? ' data-skip="1"' : "") + ">Save note</button>" +
+            '<button type="button" class="btn" data-act="close">' + (skip ? "Not now" : "Close") + "</button></div>");
+        setTimeout(function () { var el = $("nc"); if (el && U.sheet) el.focus(); }, 260);
+    }
+    function threeInARow(M, h, date) {   // SAME IDEA AS check_recent_misses (app.py): the two days before this one were also misses (red or yellow)
+        return [1, 2].every(function (n) { var st = cellOf(M, h, addDays(date, -n))[0]; return st === "red" || st === "yellow"; });
     }
     function readValue(h) {
         var raw = $("hv").value;
@@ -380,57 +478,88 @@
         el.classList.remove("good", "badv");
         if (!isNaN(v)) el.classList.add(statusFor(h.tracking_type, h.target, v, h.direction) === "green" ? "good" : "badv");
     }
-    function setCell(h, status, value) {
-        var date = U.date;
+    function missedStatus(h) { return h.list_type === "nonneg" ? "red" : "yellow"; }
+    function setCell(h, status, value, date) {
+        date = date || D();
         if (diffDays(date, today()) > 0) { toast("That day has not come yet."); return; }
         enqueue({ type: "cell", habit: h.id, date: date, status: status, value: value });
         render();
+        // a miss that makes three in a row asks what happened (the answer is saved as a skip-reason note, like on the laptop)
+        if ((status === "red" || status === "yellow") && !h.derived && threeInARow(model(), h, date)) openNote(h, date, true);
     }
 
     // ---- food sheet (add / edit)
     function openFood(opts) {
         var M = model();
         if (!M) return;
-        var e = opts.entry || null;
-        var foods = (M.snap.food && M.snap.food.foods) || [];
+        var e = opts.entry || null, date = D();
         var meal = e ? e.meal : opts.meal || guessMeal();
-        var body = "<h2>" + (e ? "Edit food" : "Add food") + '</h2><div class="sub">' + esc(dayFull(U.date)) + "</div>";
-        if (foods.length) {
-            body += '<label for="fs">Saved foods (from the laptop)</label><input id="fs" type="search" placeholder="Search saved foods" autocomplete="off"><div class="saved" id="fchips"></div>';
-        } else {
-            body += '<div class="sub">No saved foods yet. Add them in My foods on the laptop; they will appear here.</div>';
-        }
-        body += '<label for="fn">Name</label><input id="fn" type="text" maxlength="80" value="' + esc(e ? e.name : "") + '" autocomplete="off">' +
+        var body = "<h2>" + (e ? "Edit food" : "Add food") + '</h2><div class="sub">' + esc(dayFull(date)) + "</div>";
+        body += '<label for="fn">Name</label><div class="ta"><input id="fn" type="text" maxlength="80" value="' + esc(e ? e.name : "") + '" autocomplete="off" autocapitalize="sentences" role="combobox" aria-expanded="false" aria-controls="fta"><div class="ta-list" id="fta" role="listbox" hidden></div></div>' +
             '<div class="grid3"><div><label for="fq">Quantity</label><input id="fq" type="number" inputmode="decimal" step="any" min="0" value="' + (e ? e.qty : 1) + '"></div>' +
             '<div><label for="fk">kcal each</label><input id="fk" type="number" inputmode="decimal" step="any" min="0" value="' + (e ? e.unit_kcal : "") + '"></div>' +
             '<div><label for="fp">Protein g each</label><input id="fp" type="number" inputmode="decimal" step="any" min="0" value="' + (e ? e.unit_protein : "") + '"></div></div>' +
             '<label for="fm">Meal</label><select id="fm">' + MEALS.map(function (m) { return '<option value="' + m + '"' + (m === meal ? " selected" : "") + ">" + m.charAt(0).toUpperCase() + m.slice(1) + "</option>"; }).join("") + "</select>" +
+            (e ? "" : '<label class="chk" id="fsave-wrap" hidden><input type="checkbox" id="fsave" checked><span>Save to my foods</span></label>') +
             '<div class="total" id="ftotal"></div>' +
             '<div class="btns"><button type="button" class="btn primary" data-act="food-save"' + (e ? ' data-id="' + esc(e.id) + '"' : "") + ">Save</button>" +
             (e ? '<button type="button" class="btn danger" data-act="food-del" data-id="' + esc(e.id) + '">Delete</button>' : "") +
             '<button type="button" class="btn" data-act="close">Cancel</button></div>';
         openSheet(body);
         U.foodId = e && e.food_id != null ? e.food_id : null;
+        U.taList = [];
         var upd = function () {
             var q = parseFloat($("fq").value) || 0, k = parseFloat($("fk").value) || 0, p = parseFloat($("fp").value) || 0;
             $("ftotal").textContent = "Total: " + num(k * q) + " kcal · " + num(p * q) + " g protein";
         };
-        ["fq", "fk", "fp"].forEach(function (id) { $(id).addEventListener("input", upd); });
-        $("fn").addEventListener("input", function () { U.foodId = null; });
+        ["fq", "fk", "fp"].forEach(function (id) { $(id).addEventListener("input", upd); $(id).addEventListener("focus", hideTypeahead); });
+        $("fm").addEventListener("focus", hideTypeahead);
+        // type-ahead: saved foods (+ the ones just saved from this phone) matching what is typed; a tap fills name, kcal and protein per unit
+        $("fn").addEventListener("input", function () {
+            U.foodId = null;   // typing after a pick makes it a different food
+            var M2 = model(), term = this.value.trim().toLowerCase();
+            var exact = savedFood(M2, term);
+            if (exact && !$("fk").value && !$("fp").value) { fillFood(exact); upd(); }   // the exact name with the numbers still empty fills them, like the laptop
+            else paintTypeahead(M2, term);
+            saveBox();
+        });
+        $("fn").addEventListener("focus", function () { paintTypeahead(model(), $("fn").value.trim().toLowerCase()); });
+        saveBox();
         upd();
-        if (foods.length) {
-            var paint = function () {
-                var term = $("fs").value.trim().toLowerCase();
-                var list = foods.filter(function (f) { return !term || f.name.toLowerCase().indexOf(term) >= 0; }).slice(0, 40);
-                $("fchips").innerHTML = list.length ? list.map(function (f) {
-                    return '<button type="button" data-act="food-pick" data-fid="' + f.id + '"' + (U.foodId === f.id ? ' class="on"' : "") + ">" + esc(f.name) + " · " + num(f.kcal) + "</button>";
-                }).join("") : '<span class="sub">No match</span>';
-            };
-            $("fs").addEventListener("input", paint);
-            paint();
-            U.foodPaint = paint;
-        }
-        if (!e) setTimeout(function () { var el = $(foods.length ? "fs" : "fn"); if (el) el.focus(); }, 300);
+        if (!e) setTimeout(function () { var el = $("fn"); if (el && U.sheet) el.focus(); }, 260);
+    }
+    function foodMatches(M, term) {
+        if (!term) return [];
+        var hit = M.foods.filter(function (f) { return String(f.name).toLowerCase().indexOf(term) >= 0; });
+        hit.sort(function (a, b) {
+            var pa = String(a.name).toLowerCase().indexOf(term) === 0 ? 0 : 1, pb = String(b.name).toLowerCase().indexOf(term) === 0 ? 0 : 1;
+            return pa - pb || (String(a.name).toLowerCase() < String(b.name).toLowerCase() ? -1 : 1);
+        });
+        return hit.slice(0, 6);
+    }
+    function paintTypeahead(M, term) {
+        var box = $("fta");
+        if (!box) return;
+        var list = foodMatches(M, term).filter(function (f) { return String(f.name).trim().toLowerCase() !== term; });   // an exact, finished name needs no suggestion
+        U.taList = list;
+        box.innerHTML = list.map(function (f, i) {
+            return '<button type="button" role="option" data-act="food-pick" data-i="' + i + '"><span class="t-name">' + esc(f.name) + (f.pending ? " •" : "") + '</span><span class="t-nums">' + num(f.kcal) + " kcal · " + num(f.protein) + " g</span></button>";
+        }).join("");
+        box.hidden = !list.length;
+        $("fn").setAttribute("aria-expanded", list.length ? "true" : "false");
+    }
+    function hideTypeahead() { var box = $("fta"); if (box) { box.hidden = true; $("fn").setAttribute("aria-expanded", "false"); } }
+    function fillFood(f) {
+        $("fn").value = f.name; $("fk").value = f.kcal; $("fp").value = f.protein;
+        U.foodId = typeof f.id === "number" ? f.id : null;   // a food saved from this phone has no laptop id yet
+        if (!(+$("fq").value > 0)) $("fq").value = 1;
+        hideTypeahead();
+    }
+    function saveBox() {   // "Save to my foods": only for a name that is not a saved food yet (add only)
+        var w = $("fsave-wrap");
+        if (!w) return;
+        var name = $("fn").value.trim();
+        w.hidden = !name || !!savedFood(model(), name) || U.foodId != null;
     }
     function guessMeal() { var h = new Date().getHours(); return h < 11 ? "breakfast" : h < 15 ? "lunch" : h < 18 ? "snack" : "dinner"; }
     function saveFood(editId) {
@@ -442,8 +571,10 @@
             var id = /^\d+$/.test(editId) ? Number(editId) : editId;
             if (!enqueue(Object.assign({ type: "food_edit", entry: id }, f))) { toast("This entry is still being sent. Try again in a moment."); return; }
         } else {
-            if (diffDays(U.date, today()) > 0) { toast("That day has not come yet."); return; }
-            enqueue(Object.assign({ type: "food_add", date: U.date }, f));
+            if (diffDays(D(), today()) > 0) { toast("That day has not come yet."); return; }
+            var w = $("fsave-wrap");
+            if (w && !w.hidden && $("fsave").checked) enqueue({ type: "food_lib_add", name: name, kcal: k, protein: p });   // per ONE unit, like My foods
+            enqueue(Object.assign({ type: "food_add", date: D() }, f));
         }
         closeSheet();
         render();
@@ -497,6 +628,10 @@
         try { var t = JSON.parse(localStorage.getItem(TOK)); if (t && t.token && t.exp > Date.now() + 60000) return t.token; } catch (e) { /* none */ }
         return null;
     }
+    function tokenExpiry() {
+        try { var t = JSON.parse(localStorage.getItem(TOK)); if (t && t.token) return t.exp || 0; } catch (e) { /* none */ }
+        return 0;
+    }
     function dropToken() { try { localStorage.removeItem(TOK); } catch (e) { /* ignore */ } }
     function gisReady() { return !!(window.google && google.accounts && google.accounts.oauth2); }
     function loadGis() {
@@ -542,6 +677,21 @@
             if (e instanceof NeedLogin) { S.needLogin = true; S.silentFailedAt = Date.now(); save(); }
             throw e;
         });
+    }
+    // Build 27: the 1-hour token is renewed in the background, at open / resume and shortly before the hour is up while the page is visible, so
+    // logging and syncing almost never meet a sign-in. Only when this quiet renewal fails does the chip say "Tap to sign in".
+    var renewing = null;
+    function renewQuietly(force) {
+        if (renewing || !configured() || !S.consented || !navigator.onLine || document.hidden) return Promise.resolve();
+        if (tokenExpiry() > Date.now() + RENEW_AHEAD) return Promise.resolve();   // plenty of time left
+        if (!force && S.silentFailedAt && Date.now() - S.silentFailedAt < 600000) return Promise.resolve();   // the timer does not nag after a failure
+        renewing = requestToken().then(function () {
+            paintChip();
+            if (S.queue.length) scheduleSync(300);
+        }).catch(function (e) {
+            if (e instanceof NeedLogin) { S.needLogin = true; S.silentFailedAt = Date.now(); save(); paintChip(); }
+        }).then(function () { renewing = null; });
+        return renewing;
     }
     function gfetch(url, init, again) {
         init = init || {};
@@ -613,6 +763,7 @@
                 var snap = parseSnapshot(txt);
                 if (!snap) { S.lastErr = "The laptop's snapshot could not be read. Showing the last good copy."; S.snapBad = true; return null; }
                 S.snap = snap; S.snapModified = meta.modifiedTime;
+                saveSnap();
                 return null;
             });
         }).then(function () {
@@ -634,41 +785,56 @@
     }
 
     // ---------------------------------------------------------------- events
-    var longPress = { t: 0, fired: false };
+    // Quick Log check cell gestures: a TAP marks done / clears at once; a quick SECOND tap (within DOUBLE_MS) makes it missed; a long HOLD (HOLD_MS)
+    // opens the note sheet for that habit and day. A value cell: tap opens the value sheet, hold = note.
+    var G = { t: 0, fired: false, x: 0, y: 0, last: {} };
+    function habitOfCell(cell) { return (S.snap && S.snap.habits || []).filter(function (x) { return x.id === +cell.dataset.h; })[0]; }
     document.addEventListener("pointerdown", function (ev) {
         var cell = ev.target.closest && ev.target.closest('.cell[data-act="cell"]');
-        longPress.fired = false;
-        clearTimeout(longPress.t);
+        G.fired = false;
+        clearTimeout(G.t);
         if (!cell) return;
-        var h = (S.snap && S.snap.habits || []).filter(function (x) { return x.id === +cell.dataset.h; })[0];
-        if (!h || h.tracking_type !== "check" || h.derived) return;
-        longPress.t = setTimeout(function () {   // hold = "missed" (red in Non-negotiables, yellow in Work in progress), like a double-click on the laptop
-            longPress.fired = true;
+        var h = habitOfCell(cell);
+        if (!h || h.derived) return;
+        G.x = ev.clientX; G.y = ev.clientY;
+        G.t = setTimeout(function () {
+            G.fired = true;
             if (navigator.vibrate) { try { navigator.vibrate(15); } catch (e) { /* ignore */ } }
-            setCell(h, h.list_type === "nonneg" ? "red" : "yellow", null);
-        }, 520);
+            openNote(h, D(), false);
+        }, HOLD_MS);
     });
-    ["pointerup", "pointercancel", "pointerleave", "scroll"].forEach(function (n) { document.addEventListener(n, function () { clearTimeout(longPress.t); }, true); });
+    document.addEventListener("pointermove", function (ev) { if (G.t && Math.abs(ev.clientX - G.x) + Math.abs(ev.clientY - G.y) > 12) { clearTimeout(G.t); G.t = 0; } });
+    ["pointerup", "pointercancel", "pointerleave", "scroll"].forEach(function (n) { document.addEventListener(n, function () { clearTimeout(G.t); G.t = 0; }, true); });
+    document.addEventListener("contextmenu", function (ev) { if (ev.target.closest && ev.target.closest(".cell")) ev.preventDefault(); });   // no Android long-press menu on a cell
+
+    function setDate(n, fade) { U.dates[U.tab] = n; if (fade !== false) U.enter = true; render(); }
+    function checkRollover() {   // a new day (or an app that was away a while) is a fresh "open": Quick Log back on yesterday, Food and Schedule on today
+        if (U.sheet) return;
+        if (U.dayStamp !== today()) { resetDates(); U.enter = true; render(); }
+    }
 
     document.addEventListener("click", function (ev) {
         var tab = ev.target.closest && ev.target.closest("[data-tab]");
-        if (tab) { U.tab = tab.dataset.tab; try { sessionStorage.setItem("duck.tab", U.tab); } catch (e) { /* ignore */ } var lim = LIMITS[U.tab], n = diffDays(U.date, today()); if (n < lim[0]) U.date = addDays(today(), lim[0]); if (n > lim[1]) U.date = addDays(today(), lim[1]); closeSheet(); U.enter = true; render(); return; }
-        if (ev.target.id === "backdrop") { closeSheet(); return; }
+        if (tab) { U.tab = tab.dataset.tab; try { sessionStorage.setItem("duck.tab", U.tab); } catch (e) { /* ignore */ } closeSheet(); U.enter = true; render(); return; }
+        if (ev.target.id === "backdrop") { if (Date.now() - (U.sheetAt || 0) > 450) closeSheet(); return; }
         var el = ev.target.closest && ev.target.closest("[data-act]");
         if (!el) return;
         var act = el.dataset.act, M;
-        if (act === "cell" && longPress.fired) { longPress.fired = false; return; }
+        if (act === "cell" && G.fired) { G.fired = false; return; }   // the hold already opened the note sheet
         switch (act) {
             case "chip": if (S.needLogin && configured()) syncNow(true); else openSync(); break;
-            case "day": U.date = addDays(U.date, +el.dataset.n); U.dayStamp = today(); U.enter = true; render(); break;
-            case "day-today": U.date = today(); U.enter = true; render(); break;
+            case "day": setDate(addDays(D(), +el.dataset.n)); break;
+            case "day-today": setDate(today()); break;
+            case "ql-set": setDate(addDays(today(), +el.dataset.d)); break;
             case "habit": openHabit(+el.dataset.h); break;
             case "cell": {
                 M = model(); var h = M && M.byId[+el.dataset.h];
                 if (!h) break;
                 if (h.derived) { openHabit(h.id); break; }
                 if (h.tracking_type !== "check") { openHabit(h.id); break; }
-                setCell(h, cellOf(M, h, U.date)[0] === "green" ? "grey" : "green", null);
+                var date = D(), gk = h.id + ":" + date, now = Date.now();
+                if (G.last[gk] && now - G.last[gk] < DOUBLE_MS) { G.last = {}; setCell(h, missedStatus(h), null, date); }   // quick second tap = missed
+                else { G.last = {}; G.last[gk] = now; setCell(h, cellOf(M, h, date)[0] === "green" ? "grey" : "green", null, date); }   // tap = done / cleared at once
                 break;
             }
             case "set-status": { M = model(); var hh = M.byId[+el.dataset.h]; closeSheet(); setCell(hh, el.dataset.s, null); break; }
@@ -683,7 +849,9 @@
             case "save-note": {
                 var title = $("nt").value.trim(), content = $("nc").value.trim();
                 if (!title && !content) { toast("Write something first."); break; }
-                enqueue({ type: "note", habit: +el.dataset.h, date: U.date, title: title, content: content });
+                var nch = { type: "note", habit: +el.dataset.h, date: el.dataset.date || D(), title: title, content: content };
+                if (el.dataset.skip) nch.skip_reason = true;   // the "Three in a row" answer is a skip reason (the laptop files it with is_skip_reason = 1)
+                enqueue(nch);
                 closeSheet(); toast("Note saved. It will sync when there is internet."); break;
             }
             case "food-add": openFood({ meal: el.dataset.meal }); break;
@@ -695,15 +863,7 @@
                 openFood({ entry: f.list[f.i] });
                 break;
             }
-            case "food-pick": {
-                var fid = +el.dataset.fid, food = ((model().snap.food || {}).foods || []).filter(function (x) { return x.id === fid; })[0];
-                if (!food) break;
-                $("fn").value = food.name; $("fk").value = food.kcal; $("fp").value = food.protein; U.foodId = food.id;
-                if (+$("fq").value <= 0) $("fq").value = 1;
-                ["fq", "fk"].forEach(function (i) { $(i).dispatchEvent(new Event("input")); });
-                if (U.foodPaint) U.foodPaint();
-                break;
-            }
+            case "food-pick": { var pf = (U.taList || [])[+el.dataset.i]; if (!pf) break; fillFood(pf); $("fn").focus(); ["fq", "fk"].forEach(function (i) { $(i).dispatchEvent(new Event("input")); }); saveBox(); break; }
             case "food-save": saveFood(el.dataset.id || ""); break;
             case "food-del": {
                 if (el.dataset.armed !== "1") { el.dataset.armed = "1"; el.textContent = "Tap again to delete"; break; }
@@ -712,15 +872,15 @@
                 closeSheet(); render(); toast("Deleted."); break;
             }
             case "tick": case "skip": {
-                M = model(); var key = el.dataset.key, it = schedItems(M, U.date).filter(function (x) { return x.key === key; })[0];
+                M = model(); var key = el.dataset.key, date2 = D(), it = schedItems(M, date2).filter(function (x) { return x.key === key; })[0];
                 if (!it) break;
                 var next;
                 if (act === "skip") next = it.state === "skip" ? "" : "skip";
                 else {
-                    if (diffDays(U.date, today()) > 0) { toast("That day has not come yet."); break; }
+                    if (diffDays(date2, today()) > 0) { toast("That day has not come yet."); break; }
                     next = it.state === "done" ? "" : "done";
                 }
-                enqueue({ type: "tick", key: key, date: U.date, state: next }); render(); break;
+                enqueue({ type: "tick", key: key, date: date2, state: next }); render(); break;
             }
             case "sync-go": closeSheet(); syncNow(true); break;
             case "clear-notice": S.overridden = 0; save(); openSync(); break;
@@ -731,26 +891,38 @@
         if (ev.key === "Escape" && U.sheet) closeSheet();
         if (ev.key === "Enter" && U.sheet && ev.target && ev.target.id === "hv") { var b = document.querySelector('[data-act="save-value"]'); if (b) b.click(); }
     });
-    window.addEventListener("online", function () { render(); scheduleSync(500); });
+    window.addEventListener("online", function () { render(); renewQuietly(true).then(function () { scheduleSync(500); }); });
     window.addEventListener("offline", function () { render(); });
     document.addEventListener("visibilitychange", function () {
-        if (document.hidden) return;
-        if (U.dayStamp !== today()) { if (U.date === U.dayStamp) U.date = today(); U.dayStamp = today(); }
+        if (document.hidden) { U.hiddenAt = Date.now(); return; }
+        // coming back after a while (or on a new day) is a fresh open: every page goes back to its own day
+        if (U.dayStamp !== today() || (U.hiddenAt && Date.now() - U.hiddenAt > AWAY_MS)) { if (!U.sheet) { resetDates(); U.enter = true; } }
+        U.hiddenAt = 0;
         render();
-        scheduleSync(300);
+        renewQuietly(true).then(function () { scheduleSync(300); });
     });
     setInterval(function () {
         if (document.hidden) return;
-        if (S.queue.length || Date.now() - S.lastSync > 5 * 60000) syncNow(false);
+        checkRollover();
+        renewQuietly(false);   // shortly before the hour is up
         paintChip();
+    }, 45000);
+    setInterval(function () {
+        if (document.hidden) return;
+        if (S.queue.length || Date.now() - S.lastSync > 5 * 60000) syncNow(false);
     }, 120000);
 
     if ("serviceWorker" in navigator && location.protocol !== "file:") {
         navigator.serviceWorker.register("sw.js").catch(function () { /* the app still works, just not offline-first */ });
     }
     window.DUCK = { state: function () { return S; }, model: model, syncNow: syncNow, render: render, version: VERSION, statusFor: statusFor, parseDuration: parseDuration,
+                    _t: { stampDay: function (d) { U.dayStamp = d; }, hiddenAt: function (ms) { U.hiddenAt = ms; }, rollover: checkRollover },   // test hooks only
+                    dates: function () { return U.dates; }, resetDates: function () { resetDates(); U.enter = true; render(); }, renew: function () { return renewQuietly(true); },
                     schedItems: function (d) { return schedItems(model(), d); }, flushNow: function () { return syncNow(true); } };
 
     render();
-    if (configured() && navigator.onLine) { setTimeout(function () { loadGis().catch(function () {}); }, 800); scheduleSync(1200); }
+    if (configured() && navigator.onLine) {
+        scheduleSync(1200);
+        setTimeout(function () { loadGis().then(function () { return renewQuietly(true); }).then(function () { if (S.queue.length) scheduleSync(300); }).catch(function () {}); }, 400);
+    }
 })();

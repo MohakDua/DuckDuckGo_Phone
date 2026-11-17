@@ -1,7 +1,8 @@
 // DuckGoDo phone - service worker. Keeps the app itself (not your data) so it opens with no signal.
 // Your data lives in this browser's storage, not here. Bump CACHE when you change any app file so phones pick the new version up.
-const CACHE = "duck-phone-b26-1";
-const SHELL = ["./", "./index.html", "./app.js", "./style.css", "./config.js", "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png"];
+const CACHE = "duck-phone-b27-1";
+const SHELL = ["./", "./index.html", "./app.js", "./style.css", "./config.js", "./manifest.webmanifest", "./icons/icon-192.png", "./icons/icon-512.png",
+    "./fonts/Inter-400.woff2", "./fonts/Inter-500.woff2", "./fonts/Inter-600.woff2", "./fonts/Inter-700.woff2"];   // Build 27: Inter lives here, so the phone never asks Google Fonts
 
 self.addEventListener("install", (e) => {
     e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));
