@@ -156,3 +156,26 @@ h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; margin: 2px 0 0
 /* toast */
 .toast { position: fixed; left: 50%; bottom: calc(var(--tabs-h) + env(safe-area-inset-bottom) + 70px); transform: translate(-50%, 8px); background: var(--card-raised); border: 1px solid var(--border-soft); color: var(--text); padding: 10px 16px; border-radius: 12px; font-size: 13px; max-width: calc(100vw - 32px); opacity: 0; pointer-events: none; transition: opacity var(--t-sheet) ease, transform var(--t-sheet) ease; z-index: 60; text-align: center; }
 .toast.show { opacity: 1; transform: translate(-50%, 0); }
+
+/* ---- Build 28: Ask AI ---- */
+.fabs { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(var(--tabs-h) + env(safe-area-inset-bottom) + 14px); display: flex; gap: 10px; z-index: 20; }
+.fabs[hidden] { display: none; }
+.fabs .fab { position: static; transform: none; white-space: nowrap; }
+.fab.ghost { background: var(--card-raised); color: var(--accent); border: 1px solid var(--accent-dim); }
+.ai-photo { margin-top: 10px; }
+.ai-thumb { display: flex; align-items: center; gap: 10px; margin-top: 10px; }
+.ai-thumb[hidden] { display: none; }
+.ai-thumb img { width: 56px; height: 56px; object-fit: cover; border-radius: 10px; border: 1px solid var(--border-soft); }
+.ai-thumb .btn { flex: 0 1 auto; min-height: 36px; font-size: 13px; }
+.ai-note { font-size: 11.5px; line-height: 1.5; color: var(--text-faint); margin-top: 12px; }
+.ai-lead { font-size: 12.5px; line-height: 1.5; color: var(--text-dim); margin-bottom: 10px; }
+.ai-row { border: 1px solid var(--border-soft); border-radius: 12px; padding: 10px; margin-bottom: 10px; background: var(--bg); }
+.ai-row input, .ai-row select { background: var(--card-raised); }
+.ai-r1 { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; }
+.ai-r1 select { flex: 1; }
+.ai-del { width: 44px; height: 44px; flex: 0 0 44px; border-radius: 12px; border: 1px solid var(--border-soft); background: transparent; color: var(--text-dim); font-size: 22px; line-height: 1; }
+.ai-row label { margin-top: 8px; }
+.ai-r3 { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 8px; min-height: 18px; }
+.ai-badge { font-size: 10.5px; letter-spacing: 0.03em; padding: 2px 8px; border-radius: 10px; color: var(--yellow); border: 1px solid #c9ab5c55; background: #c9ab5c14; }
+.ai-badge.ai-saved { color: var(--accent); border-color: var(--accent-dim); background: #7fa98a22; }
+.ai-assumed { font-size: 11.5px; color: var(--text-faint); font-style: italic; }

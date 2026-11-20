@@ -26,7 +26,7 @@
 (function () {
     "use strict";
 
-    var VERSION = "b27.1";
+    var VERSION = "b28.0";
     var KEY = "duck.phone.v1", SNAPKEY = "duck.phone.snap", TOK = "duck.phone.tok";
     var API = "https://www.googleapis.com/drive/v3", UP = "https://www.googleapis.com/upload/drive/v3";
     var SCOPE = "https://www.googleapis.com/auth/drive.appdata";
@@ -278,7 +278,7 @@
         document.querySelectorAll(".tab").forEach(function (t) { t.classList.toggle("on", t.dataset.tab === U.tab); });
         $("title").textContent = TITLES[U.tab];
         $("eyebrow").textContent = M && M.snap.username ? "Hi, " + M.snap.username : "DuckGoDo";
-        $("fab").hidden = !(U.tab === "food" && M);
+        $("fabs").hidden = !(U.tab === "food" && M);   // the "+ Add food" and "Ask AI" pair
         morph($("daybar"), daybarHtml());
         var html;
         if (!M) html = emptyHtml();
@@ -581,6 +581,270 @@
         toast(editId ? "Saved." : "Added. It will sync when there is internet.");
     }
 
+    // ================================================================ AI FOOD (Build 28)
+    // "Ask AI" on the Food tab: type what you ate and/or add a photo; this phone asks Gemini DIRECTLY (no laptop needed) for a PROPOSED
+    // list, shows it as an editable card, and only when you press Add does each row become an ordinary food_add change.
+    // COUPLING: AI_PROMPT, AI_SCHEMA, readReply and cleanItems are copies of AI_PROMPT, AI_SCHEMA, gemini_read and ai_clean_items in app.py.
+    // Change one, change the other (tests/test_ai_food.py compares the prompt and schema). The key lives ONLY in its own localStorage slot (GKEY).
+    var GEMINI_MODEL = "gemini-3.6-flash";                        // the ONE place the model id lives on the phone (the laptop's is GEMINI_MODEL in app.py)
+    var GEMINI_BASE = "https://generativelanguage.googleapis.com";
+    var GKEY = "duck.phone.gemini";                               // the Gemini key: its own slot - never inside S, the queue, the snapshot or anything uploaded
+    var GEMINI_TIMEOUT = 45000, AI_MAX_PX = 1024, AI_MAX_SAVED = 150, AI_MAX_ITEMS = 30, AI_MAX_TEXT = 2000;
+    var AI_PROMPT = "You help log food in a personal habit tracker. From the person's description and/or photo, list what they ate as separate food items.\nReply with JSON only, in exactly this shape: {\"items\":[{\"meal\":\"breakfast|lunch|snack|dinner\",\"name\":\"short food name\",\"qty\":number,\"kcal\":number,\"protein\":number,\"food_id\":integer or null,\"note\":\"short text\",\"estimate\":true or false}]}\nRules:\n- kcal and protein are for ONE unit (qty 1), not the total. qty is how many units were eaten, for example 2 for two eggs.\n- Below is the person's list of saved foods, with kcal and protein per unit. When an item is the same food as a saved one, prefer it: use that saved food's id as food_id, and its name and numbers. Otherwise food_id is null and you give your own numbers.\n- Always state your portion assumption in note, in a few words, for example \"1 medium bowl, about 200 g\". Never leave note empty.\n- Set estimate to true when the numbers come from guessing portions in a photo or from a vague description, and false when they come from a saved food or a clear quantity.\n- Choose meal from what the person says. If they do not say, guess from the time: before 11:00 breakfast, 11:00 to 14:59 lunch, 15:00 to 17:59 snack, 18:00 or later dinner.\n- The entry is for the date {DATE}. The time now is {TIME}.\n- Use the person's own words for names where you can. Keep names short.\n- If there is no food in the text or photo, return {\"items\":[]}.\nSaved foods (id | name | kcal per unit | protein g per unit):\n{SAVED}\nThe person wrote: {TEXT}";
+    var AI_SCHEMA = {"type": "object", "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"meal": {"type": "string", "enum": ["breakfast", "lunch", "snack", "dinner"]}, "name": {"type": "string"}, "qty": {"type": "number"}, "kcal": {"type": "number"}, "protein": {"type": "number"}, "food_id": {"type": "integer", "nullable": true}, "note": {"type": "string"}, "estimate": {"type": "boolean"}}, "required": ["meal", "name", "qty", "kcal", "protein", "food_id", "note", "estimate"]}}}, "required": ["items"]};
+    var AI_ERRORS = {
+        nokey: "No Gemini key on this phone yet. Open Sync (the dot at the top) and paste your key there.",
+        badkey: "Google did not accept the key. Open Sync and check that the whole key was pasted, and that the key is allowed to use the Gemini API.",
+        limit: "Google says there were too many requests, or today's free allowance is used up. Wait a minute and try again.",
+        offline: "This needs internet. Could not reach Google, so nothing was sent. What you typed is still here.",
+        timeout: "Google took too long to answer. Try again in a moment. What you typed is still here.",
+        blocked: "Google blocked that one and sent nothing back. Try describing it a different way.",
+        malformed: "The AI's reply did not come back in a form I can read. Try again, or add the foods by hand.",
+        server: "Google had a problem on its side. Try again in a bit.",
+        empty: "Type what you ate, or add a photo.",
+        image: "I could not read that picture. Try a different one."
+    };
+    var AI = { text: "", img: "", preview: "", items: [], date: "", busy: false };
+    var gMem = "";
+    function gkeyGet() { try { return (localStorage.getItem(GKEY) || gMem || "").trim(); } catch (e) { return (gMem || "").trim(); } }
+    function gkeySet(v) { gMem = v; try { if (v) localStorage.setItem(GKEY, v); else localStorage.removeItem(GKEY); } catch (e) { /* kept in memory until the page closes */ } }
+
+    function aiNum(x) { x = Math.round(Number(x) * 10) / 10; return String(x); }   // 63 -> "63" (same as _ai_num in app.py; an exact half may differ by 0.1, which is harmless)
+    function aiSavedLines(M) {
+        var list = M.foods.filter(function (f) { return typeof f.id === "number"; }).sort(function (a, b) { return b.id - a.id; }).slice(0, AI_MAX_SAVED);
+        var out = list.map(function (f) { return [f.id, String(f.name || "").replace(/\s+/g, " ").trim().slice(0, 60), aiNum(f.kcal), aiNum(f.protein)]; })
+            .filter(function (r) { return r[1]; }).map(function (r) { return r.join(" | "); });
+        return out.length ? out.join("\n") : "(none yet)";
+    }
+    function aiPromptText(text, saved, date, time) {
+        return AI_PROMPT.split("{DATE}").join(date).split("{TIME}").join(time).split("{SAVED}").join(saved).split("{TEXT}").join(text || "(nothing typed, see the photo)");
+    }
+    function aiHM() { var n = new Date(); return p2(n.getHours()) + ":" + p2(n.getMinutes()); }
+    function mealForTime(hm) { var h = parseInt(String(hm).split(":")[0], 10); if (isNaN(h)) h = 12; return h < 11 ? "breakfast" : h < 15 ? "lunch" : h < 18 ? "snack" : "dinner"; }
+    function clampNum(v, def, lo, hi) { var n = typeof v === "number" ? v : parseFloat(v); if (typeof v === "boolean" || isNaN(n)) return def; return Math.min(hi, Math.max(lo, n)); }
+
+    function cleanItems(M, raw, hm) {
+        var out = [];
+        (Array.isArray(raw) ? raw : []).slice(0, AI_MAX_ITEMS).forEach(function (it) {
+            if (!it || typeof it !== "object" || Array.isArray(it)) return;
+            var name = String(it.name == null ? "" : it.name).replace(/\s+/g, " ").trim().slice(0, 80);
+            if (!name) return;
+            var meal = MEALS.indexOf(it.meal) >= 0 ? it.meal : mealForTime(hm);
+            var qty = clampNum(it.qty, 1, 0.01, 1000), kcal = clampNum(it.kcal, 0, 0, 100000), protein = clampNum(it.protein, 0, 0, 10000);
+            var fid = null;
+            if (it.food_id !== null && it.food_id !== undefined && typeof it.food_id !== "boolean" && isFinite(Number(it.food_id))) fid = Math.trunc(Number(it.food_id));
+            if (fid !== null) {
+                var hit = null;
+                M.foods.forEach(function (f) { if (f.id === fid) hit = f; });
+                if (hit) { name = String(hit.name).slice(0, 80); kcal = Number(hit.kcal) || 0; protein = Number(hit.protein) || 0; } else fid = null;
+            }
+            out.push({ meal: meal, name: name, qty: qty, kcal: round1(kcal), protein: round1(protein), food_id: fid,
+                       note: String(it.note == null ? "" : it.note).replace(/\s+/g, " ").trim().slice(0, 160), estimate: !!it.estimate });
+        });
+        return out;
+    }
+    function readReply(payload) {
+        if (!payload || typeof payload !== "object") return { ok: false, code: "malformed" };
+        if (payload.promptFeedback && payload.promptFeedback.blockReason) return { ok: false, code: "blocked" };
+        var cands = payload.candidates || [];
+        if (!cands.length || !cands[0] || typeof cands[0] !== "object") return { ok: false, code: cands.length ? "malformed" : "blocked" };
+        var c0 = cands[0], text = "";
+        ((c0.content && c0.content.parts) || []).forEach(function (p) { if (p && typeof p.text === "string") text += p.text; });
+        if (!text.trim()) return { ok: false, code: ["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII", "IMAGE_SAFETY"].indexOf(c0.finishReason) >= 0 ? "blocked" : "malformed" };
+        text = text.trim();
+        if (text.slice(0, 3) === "```") text = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
+        var data;
+        try { data = JSON.parse(text); } catch (e) { return { ok: false, code: "malformed" }; }
+        if (!data || typeof data !== "object" || !Array.isArray(data.items)) return { ok: false, code: "malformed" };
+        return { ok: true, data: data };
+    }
+    // Three ways to ask for JSON, newest first (Google changed its request shape recently; an "unknown field" 400 moves to the next).
+    function aiBodies(parts) {
+        var base = { contents: [{ role: "user", parts: parts }] };
+        return [
+            Object.assign({}, base, { generationConfig: { temperature: 0.2, responseFormat: { text: { mimeType: "APPLICATION_JSON", schema: AI_SCHEMA } } } }),
+            Object.assign({}, base, { generationConfig: { temperature: 0.2, responseMimeType: "application/json", responseSchema: AI_SCHEMA } }),
+            Object.assign({}, base, { generationConfig: { temperature: 0.2, responseMimeType: "application/json" } })
+        ];
+    }
+    function geminiCall(parts, key) {
+        var bodies = aiBodies(parts), i = 0, url = GEMINI_BASE + "/v1beta/models/" + GEMINI_MODEL + ":generateContent";
+        function attempt() {
+            var ctl = typeof AbortController === "function" ? new AbortController() : null;
+            var timer = setTimeout(function () { if (ctl) ctl.abort(); }, GEMINI_TIMEOUT);
+            return fetch(url, { method: "POST", headers: { "Content-Type": "application/json", "x-goog-api-key": key }, body: JSON.stringify(bodies[i]), signal: ctl ? ctl.signal : undefined })
+                .then(function (r) { return r.text().then(function (t) { clearTimeout(timer); return { status: r.status, text: t }; }); })
+                .catch(function (e) { clearTimeout(timer); return { fail: e && e.name === "AbortError" ? "timeout" : "offline" }; })
+                .then(function (res) {
+                    if (res.fail) return { ok: false, code: res.fail };
+                    var st = res.status, low = res.text.toLowerCase();
+                    if (st === 429) return { ok: false, code: "limit" };
+                    if (st === 401 || st === 403 || (st === 400 && (low.indexOf("api key") >= 0 || low.indexOf("api_key") >= 0))) return { ok: false, code: "badkey" };
+                    if (st === 400 && (low.indexOf("unknown name") >= 0 || low.indexOf("invalid json payload") >= 0 || low.indexOf("cannot find field") >= 0 || low.indexOf("unknown field") >= 0)) {
+                        i++;
+                        return i < bodies.length ? attempt() : { ok: false, code: "malformed" };
+                    }
+                    if (st >= 500) return { ok: false, code: "server" };
+                    if (st < 200 || st >= 300) return { ok: false, code: "malformed" };
+                    var payload;
+                    try { payload = JSON.parse(res.text); } catch (e) { return { ok: false, code: "malformed" }; }
+                    return readReply(payload);
+                });
+        }
+        return attempt();
+    }
+
+    // ---- photo: shrunk to AI_MAX_PX on the long side as a JPEG before it leaves the phone
+    function aiShrink(file) {
+        return new Promise(function (resolve, reject) {
+            var url = URL.createObjectURL(file), img = new Image();
+            img.onload = function () {
+                var s = Math.min(1, AI_MAX_PX / Math.max(img.naturalWidth, img.naturalHeight, 1));
+                var w = Math.max(1, Math.round(img.naturalWidth * s)), h = Math.max(1, Math.round(img.naturalHeight * s));
+                var cv = document.createElement("canvas");
+                cv.width = w; cv.height = h;
+                var cx = cv.getContext("2d");
+                cx.fillStyle = "#fff"; cx.fillRect(0, 0, w, h);
+                cx.drawImage(img, 0, 0, w, h);
+                URL.revokeObjectURL(url);
+                resolve(cv.toDataURL("image/jpeg", 0.82));
+            };
+            img.onerror = function () { URL.revokeObjectURL(url); reject(new Error("unreadable")); };
+            img.src = url;
+        });
+    }
+    function aiTakeFile(file) {
+        if (!$("ai-text")) return;
+        aiErr("");
+        aiShrink(file).then(function (dataUrl) {
+            AI.preview = dataUrl;
+            AI.img = dataUrl.slice(dataUrl.indexOf(",") + 1);
+            if ($("ai-thumb")) { $("ai-thumb-img").src = dataUrl; $("ai-thumb").hidden = false; }
+        }).catch(function () { aiErr(AI_ERRORS.image); });
+    }
+    function aiErr(msg, withSync) {
+        var el = $("ai-err");
+        if (!el) return;
+        el.textContent = msg || "";
+        el.hidden = !msg;
+        var b = $("ai-keybtn");
+        if (b) b.hidden = !(msg && withSync);
+    }
+
+    // ---- the sheet: step 1 (what did you eat) and step 2 (check the list)
+    function openAi() {
+        var M = model();
+        if (!M) return;
+        if (diffDays(D(), today()) > 0) { toast("That day has not come yet."); return; }
+        AI.date = D(); AI.text = ""; AI.img = ""; AI.preview = ""; AI.items = []; AI.busy = false;
+        aiInputSheet();
+    }
+    function aiInputSheet() {
+        var body = "<h2>Ask AI</h2><div class=\"sub\">" + esc(dayFull(AI.date)) + "</div>" +
+            '<textarea id="ai-text" rows="3" maxlength="' + AI_MAX_TEXT + '" placeholder="What did you eat? For example: 2 boiled eggs and a bowl of dal for lunch">' + esc(AI.text) + "</textarea>" +
+            '<div class="btns ai-photo"><button type="button" class="btn" data-act="ai-cam">Take photo</button><button type="button" class="btn" data-act="ai-gal">Choose photo</button></div>' +
+            '<input type="file" id="ai-file-cam" accept="image/*" capture="environment" hidden><input type="file" id="ai-file-gal" accept="image/*" hidden>' +
+            '<div class="ai-thumb" id="ai-thumb" hidden><img id="ai-thumb-img" alt="Your photo"><button type="button" class="btn" data-act="ai-nophoto">Remove photo</button></div>' +
+            '<div class="ai-note">The text and photo are sent to Google to be read. With a free-tier key Google may use them to improve its products. Portions guessed from a photo are rough.</div>' +
+            '<div class="warn" id="ai-err" role="alert" hidden></div>' +
+            '<div class="btns"><button type="button" class="btn" id="ai-keybtn" data-act="ai-key" hidden>Open Sync</button></div>' +
+            '<div class="btns"><button type="button" class="btn primary" id="ai-go" data-act="ai-go">Ask AI</button><button type="button" class="btn" data-act="close">Cancel</button></div>';
+        openSheet(body);
+        if (AI.img) { $("ai-thumb-img").src = AI.preview; $("ai-thumb").hidden = false; }
+        if (!gkeyGet()) aiErr(AI_ERRORS.nokey, true);
+    }
+    function aiAsk() {
+        if (AI.busy) return;
+        AI.text = $("ai-text").value.trim();
+        if (!AI.text && !AI.img) { aiErr(AI_ERRORS.empty); return; }
+        var key = gkeyGet();
+        if (!key) { aiErr(AI_ERRORS.nokey, true); return; }
+        if (!navigator.onLine) { aiErr(AI_ERRORS.offline); return; }
+        aiErr("");
+        AI.busy = true;
+        $("ai-go").disabled = true; $("ai-go").textContent = "Asking…";
+        var M = model(), hm = aiHM();
+        var parts = (AI.img ? [{ inlineData: { mimeType: "image/jpeg", data: AI.img } }] : []).concat([{ text: aiPromptText(AI.text.slice(0, AI_MAX_TEXT), aiSavedLines(M), AI.date, hm) }]);
+        geminiCall(parts, key).then(function (r) {
+            AI.busy = false;
+            if (!$("ai-go")) return;   // the sheet was closed meanwhile: drop the answer
+            $("ai-go").disabled = false; $("ai-go").textContent = "Ask AI";
+            if (!r.ok) { aiErr(AI_ERRORS[r.code] || AI_ERRORS.malformed, r.code === "badkey"); return; }
+            var items = cleanItems(model(), r.data.items, hm);
+            if (!items.length) { aiErr("The AI did not find any food in that. Add a few more words or a clearer photo."); return; }
+            AI.items = items;
+            aiConfirmSheet();
+        });
+    }
+    function aiConfirmSheet() {
+        var body = "<h2>Check the list</h2><div class=\"sub\">" + esc(dayFull(AI.date)) + "</div>" +
+            '<div class="ai-lead">Here is what the AI thinks you ate. Fix anything, then add it. Nothing is saved until you press Add.</div><div id="ai-rows"></div>' +
+            '<div class="total" id="ai-total"></div><div class="warn" id="ai-err" role="alert" hidden></div>' +
+            '<div class="btns"><button type="button" class="btn primary" id="ai-add" data-act="ai-add">Add</button><button type="button" class="btn" data-act="ai-back">Back</button></div>';
+        openSheet(body);
+        aiRows();
+    }
+    function aiRows() {
+        $("ai-rows").innerHTML = AI.items.map(function (it, i) {
+            return '<div class="ai-row" data-i="' + i + '"><div class="ai-r1"><select data-f="meal" aria-label="Meal">' +
+                MEALS.map(function (m) { return '<option value="' + m + '"' + (it.meal === m ? " selected" : "") + ">" + m.charAt(0).toUpperCase() + m.slice(1) + "</option>"; }).join("") + "</select>" +
+                '<button type="button" class="ai-del" data-act="ai-del" data-i="' + i + '" aria-label="Remove this row">×</button></div>' +
+                '<input type="text" data-f="name" value="' + esc(it.name) + '" maxlength="80" aria-label="Food name">' +
+                '<div class="grid3"><div><label>Quantity</label><input type="number" inputmode="decimal" step="any" min="0" data-f="qty" value="' + it.qty + '"></div>' +
+                '<div><label>kcal each</label><input type="number" inputmode="decimal" step="any" min="0" data-f="kcal" value="' + it.kcal + '"></div>' +
+                '<div><label>Protein g each</label><input type="number" inputmode="decimal" step="any" min="0" data-f="protein" value="' + it.protein + '"></div></div>' +
+                '<div class="ai-r3">' + (it.estimate ? '<span class="ai-badge">estimate</span>' : "") + (it.food_id != null ? '<span class="ai-badge ai-saved">saved food</span>' : "") +
+                '<span class="ai-assumed">' + esc(it.note) + "</span></div></div>";
+        }).join("");
+        aiTotals();
+    }
+    function aiTotals() {
+        var k = 0, p = 0, n = 0;
+        AI.items.forEach(function (it) { if (it.name.trim()) { n++; var q = it.qty > 0 ? it.qty : 0; k += it.kcal * q; p += it.protein * q; } });
+        $("ai-total").textContent = n ? "Total: " + num(k) + " kcal · " + num(p) + " g protein" : "Nothing left to add.";
+        $("ai-add").textContent = n ? "Add " + n + (n === 1 ? " food" : " foods") : "Add";
+        $("ai-add").disabled = !n;
+    }
+    function aiRowInput(ev) {
+        var t = ev.target, row = t.closest && t.closest(".ai-row");
+        if (!row || !t.dataset.f) return;
+        var it = AI.items[+row.dataset.i];
+        if (!it) return;
+        if (t.dataset.f === "meal" || t.dataset.f === "name") it[t.dataset.f] = t.value;
+        else it[t.dataset.f] = Math.max(0, parseFloat(t.value) || 0);
+        if (t.dataset.f === "name" && it.food_id != null) it.food_id = null;   // a renamed row is no longer "the saved food"
+        aiTotals();
+    }
+    function aiConfirm() {
+        var rows = AI.items.filter(function (it) { return it.name.trim(); });
+        if (!rows.length) return;
+        if (diffDays(AI.date, today()) > 0) { toast("That day has not come yet."); return; }
+        rows.forEach(function (it) {
+            enqueue({ type: "food_add", date: AI.date, meal: it.meal, name: it.name.trim().slice(0, 80), qty: it.qty > 0 ? it.qty : 1, kcal: it.kcal, protein: it.protein,
+                      food_id: it.food_id == null ? null : it.food_id });
+        });
+        AI.items = []; AI.text = ""; AI.img = ""; AI.preview = "";
+        closeSheet();
+        render();
+        toast("Added " + rows.length + (rows.length === 1 ? " food" : " foods") + ". They will sync when there is internet.");
+    }
+    document.addEventListener("input", function (ev) {
+        if (ev.target && ev.target.id === "ai-text") AI.text = ev.target.value;
+        else aiRowInput(ev);
+    });
+    document.addEventListener("change", function (ev) {
+        var t = ev.target;
+        if (t && (t.id === "ai-file-cam" || t.id === "ai-file-gal") && t.files && t.files[0]) { aiTakeFile(t.files[0]); t.value = ""; }
+        else aiRowInput(ev);
+    });
+    document.addEventListener("paste", function (ev) {
+        if (!U.sheet || !$("ai-text")) return;
+        var items = (ev.clipboardData && ev.clipboardData.items) || [];
+        for (var i = 0; i < items.length; i++) {
+            if (items[i].kind === "file" && items[i].type.indexOf("image/") === 0) { var f = items[i].getAsFile(); if (f) { ev.preventDefault(); aiTakeFile(f); return; } }
+        }
+    });
+
     // ---- sync sheet
     function openSync() {
         var waiting = S.queue.length, sent = S.sent.length;
@@ -599,6 +863,10 @@
         if (S.overridden) body += '<div class="warn">' + S.overridden + " of your changes " + (S.overridden === 1 ? "was" : "were") + " older than an edit made on the laptop, so the laptop's version was kept. The laptop's sync log lists them.</div>";
         if (MEMORY_ONLY) body += '<div class="warn">This browser is not letting the page save anything. Changes will be lost when you close it.</div>';
         if (!navigator.onLine) body += '<div class="warn">You are offline. Everything you log is kept here and sent when the signal is back.</div>';
+        // Build 28: the Gemini key for "Ask AI". It stays in this browser (its own storage slot) and is never uploaded anywhere but Google, when you ask.
+        body += '<label for="gk">Gemini key (for Ask AI)</label><input id="gk" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="' +
+            (gkeyGet() ? "A key is saved on this phone. Paste a new one to replace it." : "Paste your key here") + '"><div class="btns"><button type="button" class="btn" data-act="gk-save">Save key</button>' +
+            (gkeyGet() ? '<button type="button" class="btn" data-act="gk-clear">Remove key</button>' : "") + '</div><div class="ai-note">The key stays in this browser. It is not sent to your Drive or your laptop.</div>';
         body += '<div class="btns"><button type="button" class="btn primary" data-act="sync-go"' + (configured() ? "" : " disabled") + ">" + (S.needLogin ? "Sign in to Google" : "Sync now") + '</button><button type="button" class="btn" data-act="close">Close</button></div>';
         if (S.overridden) body += '<div class="btns"><button type="button" class="btn" data-act="clear-notice">Got it</button></div>';
         openSheet(body);
@@ -882,6 +1150,22 @@
                 }
                 enqueue({ type: "tick", key: key, date: date2, state: next }); render(); break;
             }
+            case "ai-open": openAi(); break;
+            case "ai-cam": if ($("ai-file-cam")) $("ai-file-cam").click(); break;
+            case "ai-gal": if ($("ai-file-gal")) $("ai-file-gal").click(); break;
+            case "ai-nophoto": AI.img = ""; AI.preview = ""; if ($("ai-thumb")) { $("ai-thumb").hidden = true; $("ai-thumb-img").removeAttribute("src"); } break;
+            case "ai-go": aiAsk(); break;
+            case "ai-key": openSync(); break;
+            case "ai-add": aiConfirm(); break;
+            case "ai-back": aiInputSheet(); break;
+            case "ai-del": AI.items.splice(+el.dataset.i, 1); aiRows(); break;
+            case "gk-save": {
+                var gv = ($("gk").value || "").trim();
+                if (!gv) { toast("Paste the key first."); break; }
+                if (/\s/.test(gv) || gv.length < 20) { toast("That does not look like a whole key. Paste it again."); break; }
+                gkeySet(gv); toast("Key saved on this phone."); openSync(); break;
+            }
+            case "gk-clear": gkeySet(""); toast("Key removed from this phone."); openSync(); break;
             case "sync-go": closeSheet(); syncNow(true); break;
             case "clear-notice": S.overridden = 0; save(); openSync(); break;
             case "close": closeSheet(); break;
@@ -918,7 +1202,8 @@
     window.DUCK = { state: function () { return S; }, model: model, syncNow: syncNow, render: render, version: VERSION, statusFor: statusFor, parseDuration: parseDuration,
                     _t: { stampDay: function (d) { U.dayStamp = d; }, hiddenAt: function (ms) { U.hiddenAt = ms; }, rollover: checkRollover },   // test hooks only
                     dates: function () { return U.dates; }, resetDates: function () { resetDates(); U.enter = true; render(); }, renew: function () { return renewQuietly(true); },
-                    schedItems: function (d) { return schedItems(model(), d); }, flushNow: function () { return syncNow(true); } };
+                    schedItems: function (d) { return schedItems(model(), d); }, flushNow: function () { return syncNow(true); },
+                    ai: { prompt: function () { return AI_PROMPT; }, schema: function () { return AI_SCHEMA; }, model: function () { return GEMINI_MODEL; }, hasKey: function () { return !!gkeyGet(); }, slot: GKEY } };   // test hooks only (no key getter)
 
     render();
     if (configured() && navigator.onLine) {
